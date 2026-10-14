@@ -36,6 +36,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 SQLITE_PATH = os.environ.get("SQLITE_PATH", "combot.db")
 TZ_OFFSET = int(os.environ.get("TZ_OFFSET", "5"))          # Toshkent = UTC+5
 REPORT_HOUR = int(os.environ.get("REPORT_HOUR", "20"))      # kunlik hisobot soati
+SLOT_CAPACITY = max(1, int(os.environ.get("SLOT_CAPACITY", "10")))  # bitta vaqtga nechta joy
 ADMIN_IDS = [
     int(x) for x in re.split(r"[,;\s]+", os.environ.get("ADMIN_IDS", "")) if x.strip().lstrip("-").isdigit()
 ]
@@ -135,16 +136,18 @@ SCHEMA_SQLITE = [
          label TEXT NOT NULL,
          starts_at TEXT NOT NULL,
          ends_at TEXT NOT NULL,
+         capacity INTEGER NOT NULL DEFAULT 10,
          created_at TEXT NOT NULL)""",
     """CREATE TABLE IF NOT EXISTS bookings (
          id INTEGER PRIMARY KEY AUTOINCREMENT,
-         slot_id INTEGER NOT NULL UNIQUE,
+         slot_id INTEGER NOT NULL,
          tg_id INTEGER NOT NULL,
          username TEXT NOT NULL DEFAULT '',
          first_name TEXT NOT NULL,
          last_name TEXT NOT NULL,
          phone TEXT NOT NULL,
-         created_at TEXT NOT NULL)""",
+         created_at TEXT NOT NULL,
+         UNIQUE (slot_id, tg_id))""",
     """CREATE TABLE IF NOT EXISTS states (
          tg_id INTEGER PRIMARY KEY,
          step TEXT NOT NULL,
@@ -153,6 +156,7 @@ SCHEMA_SQLITE = [
          last_name TEXT,
          updated_at TEXT NOT NULL)""",
     "CREATE INDEX IF NOT EXISTS idx_slots_start ON slots (starts_at)",
+    "CREATE INDEX IF NOT EXISTS idx_bookings_slot ON bookings (slot_id)",
 ]
 
 SCHEMA_PG = [
@@ -164,16 +168,18 @@ SCHEMA_PG = [
          label TEXT NOT NULL,
          starts_at TEXT NOT NULL,
          ends_at TEXT NOT NULL,
+         capacity INTEGER NOT NULL DEFAULT 10,
          created_at TEXT NOT NULL)""",
     """CREATE TABLE IF NOT EXISTS bookings (
          id SERIAL PRIMARY KEY,
-         slot_id INTEGER NOT NULL UNIQUE,
+         slot_id INTEGER NOT NULL,
          tg_id BIGINT NOT NULL,
          username TEXT NOT NULL DEFAULT '',
          first_name TEXT NOT NULL,
          last_name TEXT NOT NULL,
          phone TEXT NOT NULL,
-         created_at TEXT NOT NULL)""",
+         created_at TEXT NOT NULL,
+         UNIQUE (slot_id, tg_id))""",
     """CREATE TABLE IF NOT EXISTS states (
          tg_id BIGINT PRIMARY KEY,
          step TEXT NOT NULL,
@@ -182,13 +188,76 @@ SCHEMA_PG = [
          last_name TEXT,
          updated_at TEXT NOT NULL)""",
     "CREATE INDEX IF NOT EXISTS idx_slots_start ON slots (starts_at)",
+    "CREATE INDEX IF NOT EXISTS idx_bookings_slot ON bookings (slot_id)",
 ]
+
+
+def migrate() -> None:
+    """Eski bazani yangi tuzilishga o'tkazadi (bitta vaqt → bir nechta joy).
+
+    Avval `bookings.slot_id` UNIQUE edi — bitta vaqtga bitta odam. Endi joylar
+    soni `slots.capacity` bilan belgilanadi, takrorlanish esa (slot_id, tg_id)
+    juftligi bo'yicha to'siladi.
+    """
+    if IS_PG:
+        execute(f"ALTER TABLE slots ADD COLUMN IF NOT EXISTS capacity INTEGER NOT NULL DEFAULT {SLOT_CAPACITY}")
+        # Faqat slot_id ustiga qo'yilgan UNIQUE cheklovni nomi bo'yicha topib o'chiramiz
+        stale = query(
+            "SELECT c.conname FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid"
+            " WHERE t.relname = 'bookings' AND c.contype = 'u'"
+            " AND array_length(c.conkey, 1) = 1"
+            " AND (SELECT a.attname FROM pg_attribute a"
+            "      WHERE a.attrelid = t.oid AND a.attnum = c.conkey[1]) = 'slot_id'"
+        )
+        for row in stale:
+            execute(f'ALTER TABLE bookings DROP CONSTRAINT "{row["conname"]}"')
+            log.info("Eski cheklov o'chirildi: %s", row["conname"])
+        execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_bookings_slot_user ON bookings (slot_id, tg_id)")
+        return
+
+    columns = [row["name"] for row in query("PRAGMA table_info(slots)")]
+    if "capacity" not in columns:
+        execute(f"ALTER TABLE slots ADD COLUMN capacity INTEGER NOT NULL DEFAULT {SLOT_CAPACITY}")
+
+    # SQLite'da inline UNIQUE ni olib tashlash uchun jadvalni qayta qurish kerak
+    indexes = query("PRAGMA index_list(bookings)")
+    needs_rebuild = False
+    for index in indexes:
+        if not index.get("unique"):
+            continue
+        cols = [c["name"] for c in query(f"PRAGMA index_info({index['name']})")]
+        if cols == ["slot_id"]:
+            needs_rebuild = True
+    if needs_rebuild:
+        with _conn() as connection:
+            connection.executescript(
+                """
+                ALTER TABLE bookings RENAME TO bookings_old;
+                CREATE TABLE bookings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    slot_id INTEGER NOT NULL,
+                    tg_id INTEGER NOT NULL,
+                    username TEXT NOT NULL DEFAULT '',
+                    first_name TEXT NOT NULL,
+                    last_name TEXT NOT NULL,
+                    phone TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (slot_id, tg_id));
+                INSERT INTO bookings SELECT id, slot_id, tg_id, username, first_name,
+                    last_name, phone, created_at FROM bookings_old;
+                DROP TABLE bookings_old;
+                CREATE INDEX IF NOT EXISTS idx_bookings_slot ON bookings (slot_id);
+                """
+            )
+        log.info("bookings jadvali yangilandi (slot_id UNIQUE olib tashlandi)")
 
 
 def init_db() -> None:
     for statement in SCHEMA_PG if IS_PG else SCHEMA_SQLITE:
         execute(statement)
-    log.info("Baza tayyor (%s)", "Postgres" if IS_PG else f"SQLite: {SQLITE_PATH}")
+    migrate()
+    log.info("Baza tayyor (%s) · bitta vaqtga %d joy",
+             "Postgres" if IS_PG else f"SQLite: {SQLITE_PATH}", SLOT_CAPACITY)
 
 
 def get_setting(key: str, fallback: str) -> str:
@@ -239,15 +308,27 @@ SLOT_RE_ISO = re.compile(
 )
 
 
-def parse_slot_line(line: str) -> tuple[str, str, str] | str:
-    """Bitta qatorni o'qiydi. Natija: (label, starts_at, ends_at) yoki xato matni.
+CAPACITY_RE = re.compile(r"\s*[x×*]\s*(\d{1,3})$", re.IGNORECASE)
+
+
+def parse_slot_line(line: str) -> tuple[str, str, str, int] | str:
+    """Bitta qatorni o'qiydi. Natija: (label, starts_at, ends_at, joy soni) yoki xato matni.
 
     Qabul qilinadi: '15.10 14:00-16:00', '15.10.2027 ...', '2026-10-15 ...',
     '15/10 14:00 16:00'. Yil yozilmasa — joriy yil, sana o'tgan bo'lsa keyingisi.
+    Oxiriga 'x5' qo'shilsa, shu vaqtga 5 joy ajratiladi (standart: SLOT_CAPACITY).
     """
     text = " ".join(line.split())
     if not text:
         return "bo'sh qator"
+
+    capacity = SLOT_CAPACITY
+    tail = CAPACITY_RE.search(text)
+    if tail:
+        capacity = int(tail.group(1))
+        if capacity < 1:
+            return f'"{text}" — joy soni kamida 1 bo\'lishi kerak'
+        text = text[: tail.start()].strip()
 
     iso = SLOT_RE_ISO.match(text)
     dmy = None if iso else SLOT_RE_DMY.match(text)
@@ -289,7 +370,7 @@ def parse_slot_line(line: str) -> tuple[str, str, str] | str:
     except ValueError:
         return f'"{text}" — bunday sana yo\'q'
 
-    return humanize(starts_at, ends_at), starts_at, ends_at
+    return humanize(starts_at, ends_at), starts_at, ends_at, capacity
 
 
 # --------------------------------------------------------------------------
@@ -380,29 +461,90 @@ def clear_state(tg_id: int) -> None:
 # Vaqtlar va yozuvlar
 # --------------------------------------------------------------------------
 
+# Har bir vaqt yoniga nechta odam yozilganini qo'shib beradi
+WITH_TAKEN = (
+    "SELECT s.*, COALESCE(c.n, 0) AS taken FROM slots s"
+    " LEFT JOIN (SELECT slot_id, COUNT(*) AS n FROM bookings GROUP BY slot_id) c"
+    " ON c.slot_id = s.id"
+)
+
+
 def free_slots() -> list[dict]:
+    """Hali joyi bor va o'tib ketmagan vaqtlar."""
     return query(
-        "SELECT s.* FROM slots s LEFT JOIN bookings b ON b.slot_id = s.id"
-        " WHERE b.id IS NULL AND s.starts_at > ? ORDER BY s.starts_at LIMIT 40",
+        WITH_TAKEN + " WHERE s.starts_at > ? AND COALESCE(c.n, 0) < s.capacity"
+        " ORDER BY s.starts_at LIMIT 40",
         (now_local(),),
     )
 
 
 def upcoming_slots() -> list[dict]:
+    """Admin uchun: barcha kelgusi vaqtlar, to'lganlari ham."""
     return query(
-        "SELECT s.*, b.id AS booking_id, b.first_name, b.last_name, b.phone"
-        " FROM slots s LEFT JOIN bookings b ON b.slot_id = s.id"
-        " WHERE s.starts_at > ? ORDER BY s.starts_at LIMIT 50",
+        WITH_TAKEN + " WHERE s.starts_at > ? ORDER BY s.starts_at LIMIT 50",
         (now_local(),),
     )
 
 
 def get_slot(slot_id: int) -> dict | None:
-    return query_one("SELECT * FROM slots WHERE id = ?", (slot_id,))
+    return query_one(WITH_TAKEN + " WHERE s.id = ?", (slot_id,))
 
 
-def slot_taken(slot_id: int) -> bool:
-    return query_one("SELECT id FROM bookings WHERE slot_id = ?", (slot_id,)) is not None
+def slot_places_left(slot: dict) -> int:
+    return max(0, int(slot.get("capacity") or SLOT_CAPACITY) - int(slot.get("taken") or 0))
+
+
+def already_booked(slot_id: int, tg_id: int) -> bool:
+    return query_one(
+        "SELECT id FROM bookings WHERE slot_id = ? AND tg_id = ?", (slot_id, tg_id)
+    ) is not None
+
+
+def slot_members(slot_id: int) -> list[dict]:
+    return query("SELECT * FROM bookings WHERE slot_id = ? ORDER BY id", (slot_id,))
+
+
+def create_booking(slot_id: int, tg_id: int, username: str,
+                   first_name: str, last_name: str, phone: str) -> tuple[int, str]:
+    """Yozuv qo'shadi. Natija: (booking_id, xato matni).
+
+    Joylarni sanash va yozish bitta tranzaksiyada bajariladi, aks holda ikki
+    kishi bir vaqtda oxirgi joyni olib qo'yishi mumkin edi.
+    """
+    with _conn() as connection:
+        if IS_PG:
+            # Shu vaqt qatorini qulflaymiz — parallel so'rovlar navbatga turadi
+            row = connection.execute(
+                "SELECT capacity FROM slots WHERE id = %s FOR UPDATE", (slot_id,)
+            ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT capacity FROM slots WHERE id = ?", (slot_id,)
+            ).fetchone()
+        if row is None:
+            return 0, "Bu vaqt o'chirib yuborilgan"
+        capacity = int(dict(row)["capacity"] or SLOT_CAPACITY)
+
+        taken = int(dict(connection.execute(
+            _sql("SELECT COUNT(*) AS n FROM bookings WHERE slot_id = ?"), (slot_id,)
+        ).fetchone())["n"])
+        if taken >= capacity:
+            return 0, "Afsus, bu vaqtda joy qolmadi"
+
+        mine = connection.execute(
+            _sql("SELECT id FROM bookings WHERE slot_id = ? AND tg_id = ?"), (slot_id, tg_id)
+        ).fetchone()
+        if mine is not None:
+            return 0, "Siz bu vaqtga allaqachon yozilgansiz"
+
+        statement = ("INSERT INTO bookings (slot_id, tg_id, username, first_name,"
+                     " last_name, phone, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        params = (slot_id, tg_id, username, first_name, last_name, phone, now_local())
+        if IS_PG:
+            new = connection.execute(_sql(statement) + " RETURNING id", params).fetchone()
+            return int(dict(new)["id"]), ""
+        cursor = connection.execute(statement, params)
+        return int(cursor.lastrowid or 0), ""
 
 
 def upcoming_bookings() -> list[dict]:
@@ -457,8 +599,12 @@ def show_slots(chat_id: int) -> None:
     if not slots:
         send(chat_id, "Hozircha bo'sh vaqt yo'q 😔\n\nAdmin yangi vaqtlar qo'shgach qayta urinib ko'ring.")
         return
-    keyboard = [[{"text": f"🕐 {s['label']}", "callback_data": f"slot:{s['id']}"}] for s in slots]
-    send(chat_id, "Qaysi vaqtga yozilasiz?\n\n👇 Bo'sh vaqtlar:", keyboard=keyboard)
+    keyboard = [
+        [{"text": f"🕐 {s['label']} — {slot_places_left(s)} joy",
+          "callback_data": f"slot:{s['id']}"}]
+        for s in slots
+    ]
+    send(chat_id, "Qaysi vaqtga yozilasiz?\n\n👇 Joyi bor vaqtlar:", keyboard=keyboard)
 
 
 def pick_slot(chat_id: int, tg_id: int, slot_id: int) -> str:
@@ -467,13 +613,17 @@ def pick_slot(chat_id: int, tg_id: int, slot_id: int) -> str:
         return "Bu vaqt topilmadi"
     if slot["starts_at"] <= now_local():
         return "Bu vaqt o'tib ketgan"
-    if slot_taken(slot_id):
-        return "Afsus, bu vaqt band bo'lib qoldi"
+    if already_booked(slot_id, tg_id):
+        return "Siz bu vaqtga allaqachon yozilgansiz"
+    places = slot_places_left(slot)
+    if places <= 0:
+        return "Afsus, bu vaqtda joy qolmadi"
 
     set_state(tg_id, "ism", slot_id=slot_id, first_name=None, last_name=None)
     send(
         chat_id,
-        f"✅ Tanlandi: <b>{esc(slot['label'])}</b>\n\n1/3 — <b>Ismingizni</b> yozing:",
+        f"✅ Tanlandi: <b>{esc(slot['label'])}</b>\n"
+        f"Qolgan joy: {places} ta\n\n1/3 — <b>Ismingizni</b> yozing:",
         remove_keyboard=True,
     )
     return ""
@@ -538,23 +688,21 @@ def handle_step(chat_id: int, user: dict, step: str, text: str) -> None:
             return
 
         try:
-            booking_id = insert(
-                "INSERT INTO bookings (slot_id, tg_id, username, first_name, last_name, phone, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (int(state["slot_id"]), tg_id, user.get("username") or "",
-                 state["first_name"], state["last_name"], phone, now_local()),
+            booking_id, problem = create_booking(
+                int(state["slot_id"]), tg_id, user.get("username") or "",
+                state["first_name"], state["last_name"], phone,
             )
-        except Exception as error:  # noqa: BLE001 - slot_id UNIQUE: kimdir oldin ulgurdi
-            log.warning("Bron yaratilmadi: %s", error)
+        except Exception as error:  # noqa: BLE001 - baza bilan bog'liq kutilmagan nosozlik
+            log.exception("Yozuv yaratilmadi: %s", error)
+            booking_id, problem = 0, "Texnik nosozlik yuz berdi"
+
+        if problem:
             clear_state(tg_id)
-            send(
-                chat_id,
-                "Afsus, bu vaqtni sizdan oldin band qilib ulgurishdi 😔\n/start bosib boshqasini tanlang.",
-                remove_keyboard=True,
-            )
+            send(chat_id, f"😔 {problem}.\n/start bosib boshqa vaqtni tanlang.", remove_keyboard=True)
             return
 
         clear_state(tg_id)
+        after = get_slot(int(state["slot_id"])) or slot
         send(
             chat_id,
             "✅ <b>Ro'yxatdan o'tdingiz!</b>\n\n"
@@ -570,6 +718,7 @@ def handle_step(chat_id: int, user: dict, step: str, text: str) -> None:
             f"👤 {esc(state['first_name'])} {esc(state['last_name'])}\n"
             f"📞 {esc(phone)}\n"
             f"🕐 {esc(slot['label'])}\n"
+            f"👥 Shu vaqtda: {after.get('taken', 0)}/{after.get('capacity', SLOT_CAPACITY)}\n"
             f"💬 {'@' + esc(user['username']) if user.get('username') else 'username yoʻq'} (ID {tg_id})"
         )
 
@@ -621,15 +770,16 @@ def admin_save_slots(chat_id: int, tg_id: int, text: str) -> None:
         if isinstance(parsed, str):
             errors.append(parsed)
             continue
-        label, starts_at, ends_at = parsed
+        label, starts_at, ends_at, capacity = parsed
         if query_one("SELECT id FROM slots WHERE starts_at = ? AND ends_at = ?", (starts_at, ends_at)):
             skipped.append(label)
             continue
         insert(
-            "INSERT INTO slots (label, starts_at, ends_at, created_at) VALUES (?, ?, ?, ?)",
-            (label, starts_at, ends_at, now_local()),
+            "INSERT INTO slots (label, starts_at, ends_at, capacity, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (label, starts_at, ends_at, capacity, now_local()),
         )
-        added.append(label)
+        added.append(f"{label} — {capacity} joy")
 
     clear_state(tg_id)
     parts = []
@@ -647,12 +797,15 @@ def admin_show_slots(chat_id: int) -> None:
     if not rows:
         send(chat_id, "Kelgusi vaqtlar yo'q. ➕ bilan qo'shing.", keyboard=admin_menu())
         return
-    lines = [
-        f"🔴 {esc(r['label'])} — {esc(r['first_name'] or '')} {esc(r['last_name'] or '')}"
-        if r.get("booking_id")
-        else f"🟢 {esc(r['label'])} — bo'sh"
-        for r in rows
-    ]
+    lines = []
+    for row in rows:
+        taken = int(row.get("taken") or 0)
+        capacity = int(row.get("capacity") or SLOT_CAPACITY)
+        mark = "🔴" if taken >= capacity else ("🟡" if taken else "🟢")
+        lines.append(f"{mark} {esc(row['label'])} — {taken}/{capacity}")
+        for member in slot_members(int(row["id"])):
+            lines.append(f"     • {esc(member['first_name'])} {esc(member['last_name'])}"
+                         f" · {esc(member['phone'])}")
     keyboard = [[{"text": f"🗑 {r['label']}", "callback_data": f"a:del:{r['id']}"}] for r in rows[:25]]
     keyboard.append([{"text": "⬅️ Admin menyu", "callback_data": "a:menu"}])
     send(chat_id, f"🗓 <b>Kelgusi vaqtlar ({len(rows)})</b>\n\n" + "\n".join(lines) +
@@ -664,15 +817,16 @@ def admin_delete_slot(chat_id: int, slot_id: int) -> None:
     if not slot:
         send(chat_id, "Bu vaqt allaqachon o'chirilgan.", keyboard=admin_menu())
         return
-    booking = query_one("SELECT * FROM bookings WHERE slot_id = ?", (slot_id,))
+    members = slot_members(slot_id)
     execute("DELETE FROM bookings WHERE slot_id = ?", (slot_id,))
     execute("DELETE FROM slots WHERE id = ?", (slot_id,))
-    if booking:
-        send(int(booking["tg_id"]),
+    for member in members:
+        send(int(member["tg_id"]),
              f"⚠️ Afsus, <b>{esc(slot['label'])}</b> vaqtidagi yozuvingiz bekor qilindi.\n"
              "Iltimos, /start bosib boshqa vaqtni tanlang.")
     send(chat_id, f"🗑 O'chirildi: {esc(slot['label'])}" +
-         ("\n(yozilgan odamga xabar berildi)" if booking else ""), keyboard=admin_menu())
+         (f"\n({len(members)} ta yozilgan odamga xabar berildi)" if members else ""),
+         keyboard=admin_menu())
 
 
 def admin_show_bookings(chat_id: int) -> None:
@@ -703,8 +857,10 @@ def daily_report() -> None:
         format_bookings(bookings_for_day(today), f"📅 <b>Bugun ({today})</b>")
         + "\n\n━━━━━━━━━━\n\n"
         + format_bookings(upcoming_bookings()[:15], "⏭ <b>Kelgusi yozuvlar</b>")
-        + f"\n\n🟢 Bo'sh vaqtlar: {len(free_slots())} ta"
     )
+    slots = free_slots()
+    places = sum(slot_places_left(s) for s in slots)
+    text += f"\n\n🟢 Joyi bor vaqtlar: {len(slots)} ta ({places} ta bo'sh joy)"
     notify_admins(text)
 
 
@@ -815,6 +971,9 @@ def handle_callback(callback: dict) -> None:
                  "➕ <b>Vaqt qo'shish</b>\n\n"
                  "Vaqtlarni yozing. Har bir qator — bitta vaqt oralig'i:\n\n"
                  "<code>15.10 14:00-16:00\n15.10 16:00-18:00\n16.10 09:00-11:00</code>\n\n"
+                 f"Har bir vaqtga <b>{SLOT_CAPACITY} ta joy</b> ajratiladi.\n"
+                 "Boshqacha bo'lsa, oxiriga qo'shing:\n\n"
+                 "<code>15.10 14:00-16:00 x5</code>\n\n"
                  "Yilni yozish shart emas. Bekor qilish uchun /admin bosing.")
         elif action == "slots":
             admin_show_slots(chat_id)
